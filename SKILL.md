@@ -14,6 +14,13 @@ description: >
   budgeting or investment discussion, tax or accounting advice, invoice or OCR
   tasks, reimbursement workflows, or product price lookup unless the user is
   explicitly operating the ledger.
+metadata:
+  openclaw:
+    requires:
+      anyBins:
+        - python
+        - python3
+    homepage: https://github.com/SuRu711/pocketbook
 ---
 
 # Pocketbook
