@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 DEFAULT_TIMEZONE = "Asia/Shanghai"
@@ -20,11 +20,24 @@ DEFAULT_CURRENCY = "CNY"
 DEFAULT_DATA_DIR = Path.home() / ".openclaw" / "pocketbook" / "default"
 LEDGER_FILENAME = "ledger.jsonl"
 MARKDOWN_FILENAME = "personal_finance.md"
+PROFILE_FILENAME = "profile.json"
 LOCK_FILENAME = ".ledger.lock"
+LOCK_STALE_SECONDS = 120.0
 ENTRY_TYPES = {"expense", "income", "refund", "transfer"}
 EVENT_TYPES = {"create", "update", "revert"}
 UNKNOWN_VALUE = "unknown"
 TRACKED_COMPLETION_FIELDS = ("category", "payment_method", "account")
+PROFILE_ALIAS_FIELDS = {
+    "entry_type",
+    "category",
+    "payment_method",
+    "account",
+    "merchant",
+    "currency",
+    "timezone",
+}
+PROFILE_DEFAULT_FIELDS = {"currency", "timezone", "payment_method", "account"}
+PROFILE_MANAGED_FIELDS = PROFILE_ALIAS_FIELDS | PROFILE_DEFAULT_FIELDS
 MUTABLE_FIELDS = {
     "amount",
     "occurred_at",
@@ -70,6 +83,10 @@ def ledger_path(data_dir: str | Path | None) -> Path:
 
 def markdown_path(data_dir: str | Path | None) -> Path:
     return ensure_data_dir(data_dir) / MARKDOWN_FILENAME
+
+
+def profile_path(data_dir: str | Path | None) -> Path:
+    return ensure_data_dir(data_dir) / PROFILE_FILENAME
 
 
 def now_local(timezone_name: str = DEFAULT_TIMEZONE) -> datetime:
@@ -198,10 +215,19 @@ def json_dump(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True)
 
 
+def configure_standard_streams() -> None:
+    import sys
+
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+
+
 def input_stream_text() -> str:
     import sys
 
-    return sys.stdin.read()
+    return sys.stdin.buffer.read().decode("utf-8")
 
 
 def load_payload(payload_arg: str | None) -> dict[str, Any]:
@@ -215,11 +241,15 @@ def load_payload(payload_arg: str | None) -> dict[str, Any]:
 
 
 def load_events(data_dir: str | Path | None) -> list[dict[str, Any]]:
-    path = ledger_path(data_dir)
-    if not path.exists():
+    return load_events_from_path(ledger_path(data_dir))
+
+
+def load_events_from_path(path: str | Path) -> list[dict[str, Any]]:
+    resolved = Path(path)
+    if not resolved.exists():
         return []
     events: list[dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as handle:
+    with open(resolved, "r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             stripped = line.strip()
             if not stripped:
@@ -227,12 +257,143 @@ def load_events(data_dir: str | Path | None) -> list[dict[str, Any]]:
             try:
                 events.append(json.loads(stripped))
             except json.JSONDecodeError as exc:
-                raise LedgerError(f"Invalid JSON on line {line_number} of {path}.") from exc
+                raise LedgerError(f"Invalid JSON on line {line_number} of {resolved}.") from exc
     return events
 
 
+def normalize_profile(raw_profile: Any) -> dict[str, dict[str, Any]]:
+    if raw_profile in (None, ""):
+        raw_profile = {}
+    if not isinstance(raw_profile, dict):
+        raise LedgerError("profile.json must contain a JSON object.")
+
+    defaults_raw = raw_profile.get("defaults", {})
+    aliases_raw = raw_profile.get("aliases", {})
+    if defaults_raw in (None, ""):
+        defaults_raw = {}
+    if aliases_raw in (None, ""):
+        aliases_raw = {}
+    if not isinstance(defaults_raw, dict):
+        raise LedgerError("profile defaults must be an object.")
+    if not isinstance(aliases_raw, dict):
+        raise LedgerError("profile aliases must be an object.")
+
+    defaults: dict[str, str] = {}
+    for field_name, value in defaults_raw.items():
+        field = normalize_optional_string(field_name)
+        if not field or field not in PROFILE_DEFAULT_FIELDS:
+            continue
+        normalized = normalize_optional_string(value)
+        if normalized:
+            defaults[field] = normalized
+
+    aliases: dict[str, dict[str, str]] = {}
+    for field_name, mapping in aliases_raw.items():
+        field = normalize_optional_string(field_name)
+        if not field or field not in PROFILE_ALIAS_FIELDS:
+            continue
+        if not isinstance(mapping, dict):
+            raise LedgerError(f"profile alias map for {field!r} must be an object.")
+        normalized_mapping: dict[str, str] = {}
+        for alias, canonical in mapping.items():
+            alias_key = normalize_optional_string(alias)
+            canonical_value = normalize_optional_string(canonical)
+            if alias_key and canonical_value:
+                normalized_mapping[alias_key] = canonical_value
+        if normalized_mapping:
+            aliases[field] = normalized_mapping
+
+    return {"defaults": defaults, "aliases": aliases}
+
+
+def load_profile(data_dir: str | Path | None) -> dict[str, dict[str, Any]]:
+    path = profile_path(data_dir)
+    if not path.exists():
+        return {"defaults": {}, "aliases": {}}
+    with open(path, "r", encoding="utf-8") as handle:
+        return normalize_profile(json.load(handle))
+
+
+def write_json_atomically(path: str | Path, payload: Any) -> None:
+    resolved = Path(path)
+    temp_path = resolved.with_name(resolved.name + ".tmp")
+    with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, resolved)
+
+
+def save_profile(
+    data_dir: str | Path | None,
+    profile: dict[str, Any],
+    *,
+    lock_already_held: bool = False,
+) -> dict[str, dict[str, Any]]:
+    normalized = normalize_profile(profile)
+    path = profile_path(data_dir)
+    if lock_already_held:
+        write_json_atomically(path, normalized)
+    else:
+        with file_lock(data_dir):
+            write_json_atomically(path, normalized)
+    return normalized
+
+
+def apply_profile_alias(value: str, field_name: str, profile: dict[str, dict[str, Any]]) -> str:
+    aliases = profile.get("aliases", {}).get(field_name, {})
+    if not aliases:
+        return value
+    for alias, canonical in aliases.items():
+        if value == alias or value.lower() == alias.lower():
+            return canonical
+    return value
+
+
+def normalize_profile_value(
+    value: Any,
+    field_name: str,
+    profile: dict[str, dict[str, Any]],
+    fallback: str,
+    *,
+    allow_default: bool = False,
+) -> str:
+    text = normalize_optional_string(value)
+    if not text and allow_default:
+        text = normalize_optional_string(profile.get("defaults", {}).get(field_name))
+    if not text:
+        text = fallback
+    if text and text != UNKNOWN_VALUE and field_name in PROFILE_ALIAS_FIELDS:
+        text = apply_profile_alias(text, field_name, profile)
+    return text
+
+
+def _write_lock_metadata(fd: int) -> None:
+    payload = json.dumps(
+        {
+            "pid": os.getpid(),
+            "created_at": time.time(),
+        },
+        ensure_ascii=False,
+    )
+    os.write(fd, payload.encode("utf-8"))
+    os.fsync(fd)
+
+
+def _lock_age_seconds(path: Path) -> float:
+    try:
+        return time.time() - path.stat().st_mtime
+    except FileNotFoundError:
+        return 0.0
+
+
 @contextmanager
-def file_lock(data_dir: str | Path | None, timeout_seconds: float = 10.0):
+def file_lock(
+    data_dir: str | Path | None,
+    timeout_seconds: float = 10.0,
+    stale_after_seconds: float = LOCK_STALE_SECONDS,
+):
     directory = ensure_data_dir(data_dir)
     path = directory / LOCK_FILENAME
     start = time.monotonic()
@@ -240,8 +401,14 @@ def file_lock(data_dir: str | Path | None, timeout_seconds: float = 10.0):
     while fd is None:
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-            os.write(fd, str(os.getpid()).encode("utf-8"))
+            _write_lock_metadata(fd)
         except FileExistsError:
+            if stale_after_seconds > 0 and _lock_age_seconds(path) > stale_after_seconds:
+                try:
+                    os.unlink(path)
+                    continue
+                except (FileNotFoundError, PermissionError):
+                    pass
             if time.monotonic() - start > timeout_seconds:
                 raise LedgerError(f"Could not acquire lock for {path}.")
             time.sleep(0.1)
@@ -256,14 +423,48 @@ def file_lock(data_dir: str | Path | None, timeout_seconds: float = 10.0):
             pass
 
 
-def append_event(data_dir: str | Path | None, event: dict[str, Any]) -> None:
+def append_event_to_path(path: str | Path, event: dict[str, Any]) -> None:
+    resolved = Path(path)
+    line = json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+    with open(resolved, "a", encoding="utf-8", newline="\n") as handle:
+        handle.write(line)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def append_event(
+    data_dir: str | Path | None,
+    event: dict[str, Any],
+    *,
+    lock_already_held: bool = False,
+) -> None:
     path = ledger_path(data_dir)
+    if lock_already_held:
+        append_event_to_path(path, event)
+        return
     with file_lock(data_dir):
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        append_event_to_path(path, event)
+
+
+def atomic_ledger_operation(
+    data_dir: str | Path | None,
+    handler: Callable[[list[dict[str, Any]], dict[str, dict[str, Any]]], dict[str, Any]],
+) -> dict[str, Any]:
+    with file_lock(data_dir):
+        path = ledger_path(data_dir)
+        events = load_events_from_path(path)
+        profile = load_profile(data_dir)
+        result = handler(events, profile)
+        if not isinstance(result, dict):
+            raise LedgerError("Atomic handler must return a result object.")
+        event = result.get("event")
+        should_append = bool(result.get("append", event is not None))
+        if event is not None and should_append:
+            append_event_to_path(path, event)
+            result["events_after"] = events + [event]
+        else:
+            result["events_after"] = events
+        return result
 
 
 def derive_status(explicit_status: Any, entry: dict[str, Any]) -> str:
@@ -294,7 +495,7 @@ def fingerprint_for_entry(entry: dict[str, Any]) -> str:
 
 def materialize_entries(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     entries: dict[str, dict[str, Any]] = {}
-    for event in sorted(events, key=lambda item: item.get("recorded_at", "")):
+    for event_index, event in enumerate(events):
         event_type = event.get("event_type")
         entry_id = event.get("entry_id")
         if event_type not in EVENT_TYPES or not entry_id:
@@ -307,7 +508,9 @@ def materialize_entries(events: list[dict[str, Any]]) -> dict[str, dict[str, Any
                 "currency": event.get("currency", DEFAULT_CURRENCY),
                 "occurred_at": event.get("occurred_at", event.get("recorded_at")),
                 "recorded_at": event.get("recorded_at"),
+                "created_at": event.get("recorded_at"),
                 "updated_at": event.get("recorded_at"),
+                "last_event_at": event.get("recorded_at"),
                 "timezone": event.get("timezone", DEFAULT_TIMEZONE),
                 "category": event.get("category", UNKNOWN_VALUE),
                 "payment_method": event.get("payment_method", UNKNOWN_VALUE),
@@ -324,12 +527,15 @@ def materialize_entries(events: list[dict[str, Any]]) -> dict[str, dict[str, Any
                 "idempotency_key": event.get("idempotency_key", ""),
                 "reverted": False,
                 "history_event_ids": [event.get("event_id")],
+                "last_event_index": event_index,
             }
             entries[entry_id]["status"] = derive_status(entries[entry_id]["status"], entries[entry_id])
         elif event_type == "update" and entry_id in entries:
             entry = entries[entry_id]
             entry.update(dict(event.get("changes", {})))
             entry["updated_at"] = event.get("recorded_at")
+            entry["last_event_at"] = event.get("recorded_at")
+            entry["last_event_index"] = event_index
             entry["latest_source_text"] = event.get("source_text", entry["latest_source_text"])
             entry["last_reason"] = event.get("reason", "")
             entry["history_event_ids"].append(event.get("event_id"))
@@ -340,6 +546,8 @@ def materialize_entries(events: list[dict[str, Any]]) -> dict[str, dict[str, Any
             entry["reverted"] = True
             entry["status"] = "reverted"
             entry["updated_at"] = event.get("recorded_at")
+            entry["last_event_at"] = event.get("recorded_at")
+            entry["last_event_index"] = event_index
             entry["latest_source_text"] = event.get("source_text", entry["latest_source_text"])
             entry["last_reason"] = event.get("reason", "")
             entry["history_event_ids"].append(event.get("event_id"))
@@ -350,15 +558,18 @@ def active_entries(entries: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     return [entry for entry in entries.values() if not entry.get("reverted")]
 
 
-def sorted_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return sorted(
-        entries,
-        key=lambda entry: (
+def sorted_entries(entries: list[dict[str, Any]], order: str = "recent") -> list[dict[str, Any]]:
+    if order == "occurred":
+        key = lambda entry: (
             entry.get("occurred_at", ""),
-            entry.get("updated_at", entry.get("recorded_at", "")),
-        ),
-        reverse=True,
-    )
+            entry.get("last_event_index", -1),
+        )
+    else:
+        key = lambda entry: (
+            entry.get("last_event_index", -1),
+            entry.get("last_event_at", entry.get("updated_at", entry.get("recorded_at", ""))),
+        )
+    return sorted(entries, key=key, reverse=True)
 
 
 def pending_reasons(entry: dict[str, Any]) -> list[str]:
@@ -491,30 +702,81 @@ def detect_duplicate_candidates(
     return sorted(matches, key=lambda item: (item["score"], item["occurred_at"]), reverse=True)[:3]
 
 
-def build_create_event(payload: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
-    timezone_name = normalize_string(payload.get("timezone"), DEFAULT_TIMEZONE)
+def find_entry_id_by_idempotency_key(events: list[dict[str, Any]], idempotency_key: str) -> str:
+    if not idempotency_key:
+        return ""
+    for event in events:
+        if event.get("event_type") == "create" and event.get("idempotency_key") == idempotency_key:
+            return normalize_optional_string(event.get("entry_id"))
+    return ""
+
+
+def build_create_event(
+    payload: dict[str, Any],
+    events: list[dict[str, Any]],
+    profile: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    profile = normalize_profile(profile or {})
+    idempotency_key = normalize_optional_string(payload.get("idempotency_key"))
+    if idempotency_key:
+        existing_entry_id = find_entry_id_by_idempotency_key(events, idempotency_key)
+        if existing_entry_id:
+            return {
+                "append": False,
+                "event": None,
+                "entry_id": existing_entry_id,
+                "reused_existing": True,
+                "duplicate_candidates": [],
+            }
+
+    timezone_name = normalize_profile_value(
+        payload.get("timezone"),
+        "timezone",
+        profile,
+        DEFAULT_TIMEZONE,
+        allow_default=True,
+    )
     current = now_local(timezone_name)
     source_text = normalize_optional_string(payload.get("source_text"))
     if not source_text:
         raise LedgerError("source_text is required for create.")
+
     entry = {
         "entry_id": normalize_optional_string(payload.get("entry_id")) or new_id("txn"),
-        "entry_type": normalize_string(payload.get("entry_type"), "expense"),
+        "entry_type": normalize_profile_value(payload.get("entry_type"), "entry_type", profile, "expense"),
         "amount": decimal_to_str(payload.get("amount")),
-        "currency": normalize_string(payload.get("currency"), DEFAULT_CURRENCY),
+        "currency": normalize_profile_value(
+            payload.get("currency"),
+            "currency",
+            profile,
+            DEFAULT_CURRENCY,
+            allow_default=True,
+        ),
         "occurred_at": normalize_timestamp(payload.get("occurred_at"), timezone_name, current),
         "recorded_at": current.isoformat(timespec="seconds"),
         "timezone": timezone_name,
-        "category": normalize_string(payload.get("category"), UNKNOWN_VALUE),
-        "payment_method": normalize_string(payload.get("payment_method"), UNKNOWN_VALUE),
-        "account": normalize_string(payload.get("account"), UNKNOWN_VALUE),
-        "merchant": normalize_string(payload.get("merchant"), UNKNOWN_VALUE),
+        "category": normalize_profile_value(payload.get("category"), "category", profile, UNKNOWN_VALUE),
+        "payment_method": normalize_profile_value(
+            payload.get("payment_method"),
+            "payment_method",
+            profile,
+            UNKNOWN_VALUE,
+            allow_default=True,
+        ),
+        "account": normalize_profile_value(
+            payload.get("account"),
+            "account",
+            profile,
+            UNKNOWN_VALUE,
+            allow_default=True,
+        ),
+        "merchant": normalize_profile_value(payload.get("merchant"), "merchant", profile, UNKNOWN_VALUE),
         "note": normalize_optional_string(payload.get("note")),
         "needs_review": to_bool(payload.get("needs_review", False)),
         "inferred_fields": normalize_inferred_fields(payload.get("inferred_fields")),
         "confidence": normalize_confidence(payload.get("confidence")),
         "source_text": source_text,
-        "idempotency_key": normalize_optional_string(payload.get("idempotency_key")),
+        "idempotency_key": idempotency_key,
     }
     if entry["entry_type"] not in ENTRY_TYPES:
         raise LedgerError(f"entry_type must be one of {sorted(ENTRY_TYPES)}.")
@@ -525,15 +787,23 @@ def build_create_event(payload: dict[str, Any], events: list[dict[str, Any]]) ->
         "event_type": "create",
         **entry,
     }
-    duplicates = detect_duplicate_candidates(materialize_entries(events).values(), event)
-    return {"event": event, "duplicate_candidates": duplicates}
+    duplicates = detect_duplicate_candidates(active_entries(materialize_entries(events)), event)
+    return {
+        "append": True,
+        "event": event,
+        "entry_id": event["entry_id"],
+        "reused_existing": False,
+        "duplicate_candidates": duplicates,
+    }
 
 
 def build_update_event(
     payload: dict[str, Any],
     events: list[dict[str, Any]],
+    profile: dict[str, dict[str, Any]] | None = None,
     entry_id_override: str | None = None,
 ) -> dict[str, Any]:
+    profile = normalize_profile(profile or {})
     entry_id = entry_id_override or normalize_optional_string(payload.get("entry_id"))
     if not entry_id:
         raise LedgerError("entry_id is required for update.")
@@ -543,6 +813,7 @@ def build_update_event(
     changes = payload.get("changes")
     if not isinstance(changes, dict) or not changes:
         raise LedgerError("changes must be a non-empty object.")
+
     entries = materialize_entries(events)
     entry = entries.get(entry_id)
     if not entry or entry.get("reverted"):
@@ -555,14 +826,24 @@ def build_update_event(
         if field_name == "amount":
             normalized_changes[field_name] = decimal_to_str(raw_value)
         elif field_name == "occurred_at":
-            normalized_changes[field_name] = normalize_timestamp(raw_value, entry.get("timezone", DEFAULT_TIMEZONE))
+            normalized_changes[field_name] = normalize_timestamp(
+                raw_value,
+                entry.get("timezone", DEFAULT_TIMEZONE),
+            )
         elif field_name == "needs_review":
             normalized_changes[field_name] = to_bool(raw_value)
         elif field_name == "inferred_fields":
             normalized_changes[field_name] = normalize_inferred_fields(raw_value)
         elif field_name == "confidence":
             normalized_changes[field_name] = normalize_confidence(raw_value)
-        elif field_name in {"category", "payment_method", "account", "merchant", "currency", "entry_type", "status"}:
+        elif field_name in {"category", "payment_method", "account", "merchant", "currency", "entry_type"}:
+            normalized_changes[field_name] = normalize_profile_value(
+                raw_value,
+                field_name,
+                profile,
+                UNKNOWN_VALUE if field_name in TRACKED_COMPLETION_FIELDS else normalize_optional_string(raw_value),
+            )
+        elif field_name == "status":
             normalized_changes[field_name] = normalize_string(raw_value)
         else:
             normalized_changes[field_name] = normalize_optional_string(raw_value)
@@ -586,7 +867,11 @@ def build_update_event(
         "reason": normalize_optional_string(payload.get("reason")),
         "changes": normalized_changes,
     }
-    return {"event": event}
+    return {
+        "append": True,
+        "event": event,
+        "entry_id": entry_id,
+    }
 
 
 def build_revert_event(
@@ -614,7 +899,11 @@ def build_revert_event(
         "source_text": source_text,
         "reason": normalize_optional_string(payload.get("reason")),
     }
-    return {"event": event}
+    return {
+        "append": True,
+        "event": event,
+        "entry_id": entry_id,
+    }
 
 
 def entry_response(entry: dict[str, Any]) -> dict[str, Any]:

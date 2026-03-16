@@ -9,6 +9,7 @@ import sys
 from ledger_common import (
     DEFAULT_TIMEZONE,
     active_entries,
+    configure_standard_streams,
     decimal_to_str,
     entry_response,
     filter_entries_by_period,
@@ -72,6 +73,7 @@ def render_markdown(data_dir: str | None, timezone_name: str) -> str:
 
 
 def main() -> int:
+    configure_standard_streams()
     parser = argparse.ArgumentParser(description="Render personal_finance.md from a Pocketbook ledger.")
     parser.add_argument("--data-dir", default=None, help="Ledger data root.")
     parser.add_argument("--output", default=None, help="Optional output path.")

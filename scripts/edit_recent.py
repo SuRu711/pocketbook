@@ -9,9 +9,10 @@ import sys
 from ledger_common import (
     LedgerError,
     active_entries,
-    append_event,
+    atomic_ledger_operation,
     build_revert_event,
     build_update_event,
+    configure_standard_streams,
     entry_response,
     json_dump,
     load_events,
@@ -19,14 +20,6 @@ from ledger_common import (
     materialize_entries,
     sorted_entries,
 )
-
-
-def resolve_recent_entry_id(data_dir: str | None, offset: int) -> str:
-    entries = active_entries(materialize_entries(load_events(data_dir)))
-    ordered = sorted_entries(entries)
-    if offset < 0 or offset >= len(ordered):
-        raise LedgerError(f"Recent entry offset {offset} is out of range.")
-    return ordered[offset]["entry_id"]
 
 
 def recent_response(data_dir: str | None, limit: int) -> dict:
@@ -39,21 +32,33 @@ def recent_response(data_dir: str | None, limit: int) -> dict:
 
 def update_last_command(args: argparse.Namespace) -> dict:
     payload = load_payload(args.payload)
-    events = load_events(args.data_dir)
-    entry_id = resolve_recent_entry_id(args.data_dir, args.offset)
-    result = build_update_event(payload, events, entry_id_override=entry_id)
-    append_event(args.data_dir, result["event"])
-    entries = materialize_entries(events + [result["event"]])
+    def operation(events, profile):
+        entries = active_entries(materialize_entries(events))
+        ordered = sorted_entries(entries)
+        if args.offset < 0 or args.offset >= len(ordered):
+            raise LedgerError(f"Recent entry offset {args.offset} is out of range.")
+        entry_id = ordered[args.offset]["entry_id"]
+        return build_update_event(payload, events, profile, entry_id_override=entry_id)
+
+    result = atomic_ledger_operation(args.data_dir, operation)
+    entries = materialize_entries(result["events_after"])
+    entry_id = result["entry_id"]
     return {"ok": True, "event": result["event"], "entry": entry_response(entries[entry_id])}
 
 
 def revert_last_command(args: argparse.Namespace) -> dict:
     payload = load_payload(args.payload)
-    events = load_events(args.data_dir)
-    entry_id = resolve_recent_entry_id(args.data_dir, args.offset)
-    result = build_revert_event(payload, events, entry_id_override=entry_id)
-    append_event(args.data_dir, result["event"])
-    entries = materialize_entries(events + [result["event"]])
+    def operation(events, profile):
+        entries = active_entries(materialize_entries(events))
+        ordered = sorted_entries(entries)
+        if args.offset < 0 or args.offset >= len(ordered):
+            raise LedgerError(f"Recent entry offset {args.offset} is out of range.")
+        entry_id = ordered[args.offset]["entry_id"]
+        return build_revert_event(payload, events, entry_id_override=entry_id)
+
+    result = atomic_ledger_operation(args.data_dir, operation)
+    entries = materialize_entries(result["events_after"])
+    entry_id = result["entry_id"]
     return {"ok": True, "event": result["event"], "entry": entry_response(entries[entry_id])}
 
 
@@ -79,6 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    configure_standard_streams()
     parser = build_parser()
     args = parser.parse_args()
     try:

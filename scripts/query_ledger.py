@@ -10,6 +10,7 @@ from ledger_common import (
     DEFAULT_TIMEZONE,
     LedgerError,
     active_entries,
+    configure_standard_streams,
     decimal_to_str,
     entry_response,
     filter_entries_by_period,
@@ -96,6 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    configure_standard_streams()
     parser = build_parser()
     args = parser.parse_args()
     try:

@@ -76,7 +76,7 @@ Keep these files in the same data root:
 
 - `ledger.jsonl`
 - `personal_finance.md`
-- `profile.json` when user defaults or aliases need to be stored later
+- `profile.json` for user defaults and aliases
 
 Use the same `--data-dir` for every script invocation in the session.
 
@@ -98,6 +98,8 @@ Extract as many of these fields as possible from the user utterance:
 Require `amount`. If it is missing, ask for it.
 
 Default the date or time to now in `Asia/Shanghai` when the user does not specify it, and add the inferred field name to `inferred_fields`.
+
+If `profile.json` exists, use its defaults and aliases before falling back to `unknown`. This is the preferred place for normalizing terms such as `微信 -> wechat` or `招行 -> cmb`.
 
 Allow `category`, `payment_method`, and `account` to be missing. Persist them as `unknown`, mark the entry `incomplete`, and continue without extra questions unless the user explicitly wants a precise record right now.
 
@@ -157,6 +159,9 @@ Use these scripts:
 - `python scripts/edit_recent.py update-last --data-dir <dir> --payload <json-file-or->`
 - `python scripts/edit_recent.py revert-last --data-dir <dir> --payload <json-file-or->`
 - `python scripts/render_finance_md.py --data-dir <dir>`
+- `python scripts/profile_manager.py show --data-dir <dir>`
+- `python scripts/profile_manager.py set-default --data-dir <dir> --field payment_method --value wechat`
+- `python scripts/profile_manager.py set-alias --data-dir <dir> --field account --alias 招行 --value cmb`
 
 Pass structured payloads to scripts. Do not ask the scripts to interpret free-form language.
 

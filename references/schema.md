@@ -10,7 +10,7 @@ Files:
 
 - `ledger.jsonl`: append-only event log and source of truth
 - `personal_finance.md`: derived readable view
-- `profile.json`: optional user defaults and aliases
+- `profile.json`: user defaults and aliases
 
 ## Event Model
 
@@ -75,6 +75,53 @@ Revert payload fields:
 
 - `entry_id`
 - `reason`: optional short explanation
+
+## Profile Model
+
+`profile.json` is optional, but when present it should be applied before falling back to `unknown`.
+
+Suggested structure:
+
+```json
+{
+  "defaults": {
+    "currency": "CNY",
+    "timezone": "Asia/Shanghai",
+    "payment_method": "wechat",
+    "account": "cmb"
+  },
+  "aliases": {
+    "payment_method": {
+      "微信": "wechat",
+      "wx": "wechat"
+    },
+    "account": {
+      "招行": "cmb",
+      "招商银行": "cmb"
+    },
+    "category": {
+      "餐饮": "food"
+    }
+  }
+}
+```
+
+Supported default fields:
+
+- `currency`
+- `timezone`
+- `payment_method`
+- `account`
+
+Supported alias fields:
+
+- `entry_type`
+- `category`
+- `payment_method`
+- `account`
+- `merchant`
+- `currency`
+- `timezone`
 
 ## Completion Rules
 

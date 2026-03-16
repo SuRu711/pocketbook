@@ -9,19 +9,20 @@ import sys
 
 from ledger_common import (
     LedgerError,
-    append_event,
+    atomic_ledger_operation,
     build_create_event,
     build_revert_event,
     build_update_event,
+    configure_standard_streams,
     entry_response,
     json_dump,
-    load_events,
     load_payload,
     materialize_entries,
 )
 
 
 def main() -> int:
+    configure_standard_streams()
     parser = argparse.ArgumentParser(description="Append events to a Pocketbook ledger.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -37,20 +38,23 @@ def main() -> int:
     args = parser.parse_args()
     try:
         payload = load_payload(args.payload)
-        events = load_events(args.data_dir)
-        if args.command == "create":
-            result = build_create_event(payload, events)
-        elif args.command == "update":
-            result = build_update_event(payload, events)
-        else:
-            result = build_revert_event(payload, events)
-        append_event(args.data_dir, result["event"])
-        entries = materialize_entries(events + [result["event"]])
+        def operation(events, profile):
+            if args.command == "create":
+                return build_create_event(payload, events, profile)
+            if args.command == "update":
+                return build_update_event(payload, events, profile)
+            return build_revert_event(payload, events)
+
+        result = atomic_ledger_operation(args.data_dir, operation)
+        entries = materialize_entries(result["events_after"])
+        entry_id = result["entry_id"]
         response = {
             "ok": True,
-            "event": result["event"],
-            "entry": entry_response(entries[result["event"]["entry_id"]]),
+            "entry": entry_response(entries[entry_id]),
+            "reused_existing": bool(result.get("reused_existing", False)),
         }
+        if result.get("event") is not None:
+            response["event"] = result["event"]
         if args.command == "create":
             response["duplicate_candidates"] = result["duplicate_candidates"]
         print(json_dump(response))
